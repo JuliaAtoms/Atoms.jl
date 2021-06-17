@@ -1,45 +1,69 @@
 using Atoms
+import Atoms: ECPs
 using CoulombIntegrals
 import CoulombIntegrals: locs
 using AtomicLevels
 using HalfIntegers
-using AtomicPotentials
-using PseudoPotentials
 using AngularMomentumAlgebra
+
 using SCF
+using LineSearches
+
 using PrettyTables
 using Unitful
 using UnitfulAtomic
 using Formatting
 
-# Needed as /an/ implementation of an AbstractQuasiMatrix, not the
-# only possibility:
-using FiniteDifferencesQuasi
-using FEDVRQuasi
+using CompactBases
 
+using LinearAlgebra
 using FillArrays
+using LazyArrays
 
 using Test
 
-function get_atom_grid(grid_type, rₘₐₓ, ρ, nucleus; fedvr_order=10, amend_order=true)
-    Z = charge(nucleus)
+function bspline_atomic_grid(k, m, rmax, Z)
+    h = 2.0^(-m)
+    rlin = (1:2^m)*h
+    η = 1+h
+    a = rlin[end]
+    n = floor(Int, log(Z*rmax/a)/log(η))
+    rexp = a*η.^(1:n)
+    r = vcat(0, rlin, rexp, Z*rmax)/Z
 
-    R,r = if grid_type == :fedvr
-        N = max(ceil(Int, rₘₐₓ/(ρ*fedvr_order)),2)
-        t = range(0.0, stop=rₘₐₓ, length=N)
-        amended_order = vcat(fedvr_order+5, Fill(fedvr_order,length(t)-2))
-        FEDVR(t, amend_order ? amended_order : fedvr_order)[:,2:end-1], range(t[1],stop=t[end],length=1001)
+    ArbitraryKnotSet(k, r)
+end
+
+function get_atom_grid(grid_type, rmax, nucleus; ρ=0.1, ρmax=0.6, α=0.002, intervals=30, k=4, m=2)
+    # Effective nuclear charge, subtracting those core electrons that
+    # are modelled by e.g. a pseudopotential.
+    Z = float(charge(nucleus)) - num_electrons(core(ground_state(nucleus)))
+    ρ /= Z
+
+    if grid_type == :fd_uniform
+        N = ceil(Int, rmax/ρ)
+        FiniteDifferences(N, ρ)
+    elseif grid_type == :fd_staggered
+        N = ceil(Int, rmax/ρ-1/2)
+        StaggeredFiniteDifferences(N, ρ)
+    elseif grid_type == :fd_loglin
+        StaggeredFiniteDifferences(ρ, ρmax, α, rmax)
+    elseif grid_type == :implicit_fd
+        N = ceil(Int, rmax/ρ)
+        ImplicitFiniteDifferences(N, ρ)
+    elseif grid_type == :fedvr
+        t = range(0, stop=rmax, length=intervals)
+        FEDVR(t, Vcat(k+5,Fill(k,length(t)-2)))[:,2:end-1]
+    elseif grid_type == :bsplines
+        t = bspline_atomic_grid(k, m, rmax, Z)
+        BSpline(t)[:,2:end-1]
     else
-        N = ceil(Int, rₘₐₓ/ρ + 1/2)
-        args = amend_order ? () : (zero(ρ),)
-        R=RadialDifferences(N, ρ, Z, args...)
-        R,FiniteDifferencesQuasi.locs(R)
+        error("Unknown grid type $(grid_type)")
     end
-
-    R,r
 end
 
 include("test_slater_integrals.jl")
 include("structure_setup.jl")
 include("calculation_accuracy.jl")
 include("spin_orbit.jl")
+include("projectors.jl")

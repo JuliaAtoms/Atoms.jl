@@ -22,7 +22,6 @@ Base.:(+)(h::OrbitalHamiltonian{O,T,B,OV,Proj}, λ::UniformScaling) where {O,T,B
 Base.:(-)(h::OrbitalHamiltonian, λ::UniformScaling)
 SCF.KrylovWrapper
 LinearAlgebra.mul!(y::V₁, A::KrylovWrapper{T,Hamiltonian}, x::V₂) where {V₁,V₂,T,B,Hamiltonian<:OrbitalHamiltonian}
-IterativeFactorizations.preconditioner
 ```
 
 ## Orbital integrals and terms

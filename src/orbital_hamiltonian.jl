@@ -89,6 +89,14 @@ Base.axes(hamiltonian::OrbitalHamiltonian, i) =
 
 Base.eltype(hamiltonian::OrbitalHamiltonian{aO,bO,O,T,Proj}) where {aO,bO,O,T,Proj} = T
 
+# This is strictly speaking, not correct, since the Hamiltonian
+# formally acts on the quasiaxes, which are uncountably infinite, but
+# it is practical.
+Base.size(hamiltonian::OrbitalHamiltonian) =
+    (size(hamiltonian.R,2),size(hamiltonian.R,2))
+Base.size(hamiltonian::OrbitalHamiltonian, i) = size(hamiltonian)[i]
+
+
 update!(h::OrbitalHamiltonian) = foreach(t -> update!(t), h.terms)
 function update!(h::OrbitalHamiltonian, atom::Atom)
     foreach(t -> update!(t, atom), h.terms)
@@ -108,7 +116,7 @@ function SCF.energy_matrix!(H::HM, hamiltonian::OrbitalHamiltonian{aO,bO,O,T},
     tmp = similar(ϕ)
     for term in hamiltonian.terms
         materialize!(MulAdd(coefficient(term), term.A, ϕ, zero(T), tmp))
-        H[term.i,term.j] += (ϕ'tmp)[1]
+        H[term.i,term.j] += dot(ϕ.args[2],tmp.args[2])
     end
     H
 end
@@ -131,6 +139,8 @@ function Base.getindex(H::OrbitalHamiltonian, term::Symbol)
         DirectPotential
     elseif term == :exchange
         ExchangePotential
+    elseif term == :twobody
+        HFPotential
     elseif term == :source
         SourceTerm
     elseif term == :shift
@@ -145,15 +155,15 @@ end
 # ** Materialization
 
 const OrbitalHamiltonianMatrixElement{aO,bO,O,T} =
-    Mul{<:Any,<:Tuple{<:AdjointRadialOrbital{T},
-                      <:OrbitalHamiltonian{aO,bO,O,T},
-                      <:RadialOrbital{T}}}
+    Applied{<:Any,typeof(*),<:Tuple{<:AdjointRadialOrbital{T},
+                                    <:OrbitalHamiltonian{aO,bO,O,T},
+                                    <:RadialOrbital{T}}}
 
 const OrbitalHamiltonianMatrixVectorProduct{aO,bO,O,T} =
-    Mul{<:Any,<:Tuple{<:OrbitalHamiltonian{aO,bO,O,T},<:RadialOrbital{T}}}
+    Applied{<:Any,typeof(*),<:Tuple{<:OrbitalHamiltonian{aO,bO,O,T},<:RadialOrbital{T}}}
 
 const OrbitalHamiltonianMatrixMatrixProduct{aO,bO,O,T} =
-    Mul{<:Any,<:Tuple{<:OrbitalHamiltonian{aO,bO,O,T},<:RadialOrbitals{T}}}
+    Applied{<:Any,typeof(*),<:Tuple{<:OrbitalHamiltonian{aO,bO,O,T},<:RadialOrbitals{T}}}
 
 Base.eltype(::OrbitalHamiltonianMatrixVectorProduct{aO,bO,O,T}) where {aO,bO,O,T} = T
 
@@ -192,9 +202,25 @@ function Base.copyto!(dest::RadialOrbitals,
     n = size(dv,2)
     for j = 1:n
         copyto!(applied(*, hamiltonian.R, view(dv, :, j)),
-                hamiltonian ⋆ applied(*, hamiltonian.R, view(bv, :, j)))
+                applied(*, hamiltonian, applied(*, hamiltonian.R, view(bv, :, j))))
     end
     dest
+end
+
+"""
+    mul!(y, h::OrbitalHamiltonian, x)
+
+Materialize the action of the [`OrbitalHamiltonian`](@ref) on the
+linear algebra vector `x` and store the result in `y`, by wrapping
+them both with the `QuasiMatrix` necessary to transform `x` and `y` to
+the function space of the Hamiltonian.
+"""
+function LinearAlgebra.mul!(y, h::OrbitalHamiltonian, x, α::Number=true, β::Number=false)
+    @assert !β
+    copyto!(applied(*, h.R, y),
+            applied(*, h, (applied(*, h.R, x))))
+    !isone(α) && lmul!(α, y)
+    y
 end
 
 Base.similar(matvec::OrbitalHamiltonianMatrixVectorProduct) =
@@ -205,7 +231,9 @@ LazyArrays.materialize(matvec::OrbitalHamiltonianMatrixVectorProduct) =
 
 function LazyArrays.materialize(matel::OrbitalHamiltonianMatrixElement)
     a,op,b = matel.args
-    materialize(applied(*, a, materialize(op⋆b)))
+    op.R isa CompactBases.BSplineOrRestricted &&
+        @warn "Implementation not correct for non-orthogonal bases"
+    apply(*, a, apply(*, op, b))
 end
 
 # *** Materialization into a matrix
@@ -217,8 +245,6 @@ get_operator_matrix(A::RadialOperator) = A.args[2]
 get_operator_matrix(A::Diagonal) = A
 get_operator_matrix(A::IdentityOperator) = I
 get_operator_matrix(A::SourceTerm) = get_operator_matrix(A.operator)
-get_operator_matrix(A) =
-    throw(ArgumentError("Don't know how to materialize a $(typeof(A)) as a matrix"))
 
 """
     copyto!(dest::AbstractMatix, hamiltonian::OrbitalHamiltonian)
@@ -245,8 +271,6 @@ function Base.copyto!(dest::M, hamiltonian::OrbitalHamiltonian) where {T,M<:Abst
     for term in hamiltonian.terms
         term.A isa SourceTerm && term.A.source_orbital ≠ hamiltonian.orbital &&
             throw(ArgumentError("It is not possible to materialize an orbitally off-diagonal $(typeof(term.A)) as a matrix"))
-        term.A isa ExchangePotential &&
-            throw(ArgumentError("It is not possible to materialize a $(typeof(term.A)) as a $M"))
         coeff = coefficient(term, c)
 
         dest += coeff*get_operator_matrix(term.A)
@@ -255,16 +279,17 @@ function Base.copyto!(dest::M, hamiltonian::OrbitalHamiltonian) where {T,M<:Abst
     dest
 end
 
-function Base.similar(h::OrbitalHamiltonian{aO,bO,O,T,Proj,RT}, ::Type{T}) where {aO,bO,O,T,Proj,RT<:AbstractFiniteDifferences}
+function Base.similar(h::OrbitalHamiltonian{aO,bO,O,T,Proj,RT}, ::Type{T}) where {aO,bO,O,T,Proj,RT<:BasisOrRestricted{<:AbstractFiniteDifferences}}
     R = h.R
     m = size(R,2)
-    # TODO: This is only valid for RadialDifferences of
-    # FiniteDifferencesQuasi.jl
+    # TODO: This is only valid for {,Staggered}FiniteDifferences of
+    # CompactBases.jl
     o = ones(T, m)
     SymTridiagonal(o,0*o[2:end])
 end
 
-Base.similar(h::OrbitalHamiltonian{aO,bO,O,T,Proj,RT}, ::Type{T}) where {aO,bO,O,T,Proj,RT<:BasisOrRestricted{<:FEDVR}} =
+Base.similar(h::OrbitalHamiltonian{aO,bO,O,T,Proj,RT}, ::Type{T}) where {aO,bO,O,T,Proj,
+                                                                         RT<:BasisOrRestricted{<:Union{<:FEDVR,<:BSpline}}} =
     Matrix(undef, h.R)
 
 LazyArrays.materialize(h::OrbitalHamiltonian) =
@@ -302,28 +327,16 @@ Construct a `KrylovWrapper` such that `hamiltonian`, that acts on
 function spaces, can be used in a Krylov solver, which works with
 linear algebra vector spaces.
 """
-SCF.KrylovWrapper(hamiltonian::OrbitalHamiltonian{aO,bO,O,T,Proj}) where {aO,bO,O,T,Proj} =
-    KrylovWrapper{T,OrbitalHamiltonian{aO,bO,O,T,Proj}}(hamiltonian)
-
-Base.size(hamiltonian::OrbitalHamiltonian, ::SCF.KrylovWrapper) =
-    (size(hamiltonian.R,2),size(hamiltonian.R,2))
-
-"""
-    mul!(y, A::KrylovWrapper{T,<:OrbitalHamiltonian}, x)
-
-Materialize the action of the [`OrbitalHamiltonian`](@ref) on the
-linear algebra vector `x` and store the result in `y`, by wrapping
-them both with the `QuasiMatrix` necessary to transform `x` and `y` to
-the function space of the Hamiltonian.
-"""
-LinearAlgebra.mul!(y::V₁, A::KrylovWrapper{T,Hamiltonian}, x::V₂) where {V₁,V₂,T,Hamiltonian<:OrbitalHamiltonian} =
-    copyto!(applied(*, A.hamiltonian.R, y),
-            A.hamiltonian⋆(applied(*, A.hamiltonian.R, x)))
+function SCF.KrylovWrapper(hamiltonian::OrbitalHamiltonian)
+    T = eltype(hamiltonian)
+    L = LinearOperator(hamiltonian, hamiltonian.R)
+    KrylovWrapper{T,typeof(L)}(L)
+end
 
 function SCF.OrthogonalKrylovWrapper(hamiltonian::OrbitalHamiltonian)
     R = hamiltonian.R
     S = R'R
-    SCF.OrthogonalKrylovWrapper(hamiltonian, KrylovWrapper(hamiltonian),
+    SCF.OrthogonalKrylovWrapper(hamiltonian, LinearOperator(hamiltonian, hamiltonian.R),
                                 length(hamiltonian.projector.orbitals), S)
 end
 
@@ -333,29 +346,3 @@ function update!(okw::SCF.OrthogonalKrylovWrapper{<:OrbitalHamiltonian})
     end
     okw
 end
-
-# ** Preconditioner
-
-"""
-    IterativeFactorizations.preconditioner(hamiltonian::OrbitalHamiltonian)
-
-Return a factorization of the matrix corresponding to `hamiltonian`,
-where all terms arising from exchange and configuration interaction
-have been removes, since they cannot be represented by a matrix.
-"""
-function IterativeFactorizations.preconditioner(hamiltonian::OrbitalHamiltonian)
-    # To form the preconditioner, we select all terms of the shifted
-    # Hamiltonian, except the exchange potentials and source terms,
-    # which are not factorizable.
-    Ph = filter(t -> !(t.A isa ExchangePotential || t.A isa SourceTerm), hamiltonian)
-    hm = materialize(Ph)
-    factorize(hm)
-end
-
-# ** Factorization
-IterativeFactorizations.factorization(hamiltonian::OrbitalHamiltonian, args...; kwargs...) =
-    IterativeFactorization(KrylovWrapper(hamiltonian), args...;
-                           isposdefA=false, verbosity=0, kwargs...)
-
-LinearAlgebra.factorize(hamiltonian::OrbitalHamiltonian) =
-    factorization(hamiltonian)

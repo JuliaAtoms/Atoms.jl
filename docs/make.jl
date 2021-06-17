@@ -5,7 +5,6 @@ using Atoms
 
 isdefined(Main, :NOPLOTS) && NOPLOTS || include("plots.jl")
 
-DocMeta.setdocmeta!(Atoms, :DocTestSetup, :(using Atoms, AtomicLevels); recursive=true)
 makedocs(
     modules = [Atoms],
     sitename = "Atoms",
@@ -25,7 +24,9 @@ makedocs(
             "Observables" => "observables.md"
         ]
     ],
-    format = Documenter.HTML(assets = ["assets/latex.js"])
+    format = Documenter.HTML(assets = ["assets/latex.js"],
+                             mathengine = Documenter.MathJax()),
+    doctest=false,
 )
 
 deploydocs(repo = "github.com/JuliaAtoms/Atoms.jl.git")

@@ -31,7 +31,6 @@ one_body_hamiltonian
 KineticEnergyHamiltonian
 PotentialEnergyHamiltonian
 AtomicOneBodyHamiltonian
-LazyArrays.:(⋆)
 LazyArrays.materialize!(ma::MulAdd{<:Any, <:Any, <:Any, T, <:AtomicOneBodyHamiltonian, Source, Dest}) where {T,Source,Dest}
 ```
 

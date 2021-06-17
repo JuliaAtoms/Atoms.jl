@@ -16,13 +16,13 @@ combinations of single-particle orbitals.
 * Usage
   The radial coordinate is represented using a basis function
   expansion that fulfils the [[https://github.com/JuliaApproximation/ContinuumArrays.jl][ContinuumArrays.jl]] interface. The
-  examples below use [[https://github.com/jagot/FiniteDifferencesQuasi.jl][FiniteDifferencesQuasi.jl]], but Atoms.jl is not
-  dependent on which basis you choose.
+  examples below use [[https://github.com/JuliaApproximation/CompactBases.jl][CompactBases.jl]], but Atoms.jl is not dependent on
+  which basis you choose.
   
   #+BEGIN_SRC julia :exports code
     using Atoms
     using AtomicLevels
-    using FiniteDifferencesQuasi
+    using CompactBases
   #+END_SRC
 
   #+RESULTS:
@@ -45,7 +45,7 @@ combinations of single-particle orbitals.
      N = ceil(Int, rₘₐₓ/ρ + 1/2)
      # Finite-difference scheme that accounts for the boundary condition at
      # r = 0
-     R = RadialDifferences(N, ρ, charge(nucleus))
+     R = StaggeredFiniteDifferences(N, ρ, float(charge(nucleus)))
    #+END_SRC
 
    #+RESULTS:

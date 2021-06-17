@@ -5,19 +5,17 @@ plot_style("ggplot")
 using PyCall
 Cycler = pyimport("cycler")
 plt.rc("axes", prop_cycle=(plt.rcParams["axes.prop_cycle"] +
-                           Cycler.cycler("linestyle", ["-","--",":","-.",".","-","--"])))
+                           Cycler.cycler("linestyle", ["-","--",":","-.",":","-","--"])))
 
 using Statistics
 using Random
 
 using Atoms
 using AtomicLevels
-using AtomicPotentials
 using SCF
 
 using LinearAlgebra
-using FiniteDifferencesQuasi
-using FEDVRQuasi
+using CompactBases
 using IntervalSets
 
 function mean_color(color::String)
@@ -112,8 +110,7 @@ function get_atom_grid(grid_type, rₘₐₓ, ρ, nucleus; fedvr_order=10)
         # Finite-differences are much lighter, but may require very
         # fine grids to converge.
         N = ceil(Int, rₘₐₓ/ρ + 1/2)
-        args = amend_order ? () : (zero(ρ),)
-        RadialDifferences(N, ρ, Z, args...)
+        StaggeredFiniteDifferences(N, ρ)
     end
 end
 

@@ -21,12 +21,72 @@ The `potential` can be used to model either the nucleus by itself (a
 point charge or a nucleus of finite extent) or the core orbitals
 (i.e. a pseudo-potential).
 """
-mutable struct Atom{T,B<:Basis,O<:AbstractOrbital,TC<:ManyElectronWavefunction,CV<:AbstractVector,P<:AbstractPotential} <: AbstractQuantumSystem
+mutable struct Atom{T,B<:Basis,O<:AbstractOrbital,TC,CV<:AbstractVector,P<:AbstractPotential,
+                    Metric, MatrixElementMetric} <: AbstractQuantumSystem
     radial_orbitals::RadialOrbitals{T,B}
     orbitals::Vector{O}
     configurations::Vector{TC}
     mix_coeffs::CV # Mixing coefficients for multi-configurational atoms
     potential::P
+    S::Metric
+    S̃::MatrixElementMetric
+end
+
+Base.eltype(::Atom{T}) where T = T
+
+"""
+    hash(atom::Atom, h::UInt)
+
+This computes a hash for `atom`, mixed with the hash seed `h`,
+considering only the fixed quantities, i.e. which radial grid is used,
+which orbitals are present (but _not_ their radial coefficients), and
+which potential describes the nucleus. The usage is then not to
+identify a particular state of the atom, but rather the basis for its
+Hilbert space. This is useful if one would like to store the radial
+and mixing coefficients to a uniquely named file, after e.g. a lengthy
+Hartree–Fock solution; one would then set up the [`Atom`](@ref)
+structure as usual, but instead of running the SCF procedure again,
+compute the hash and load the data from the corresponding file.
+"""
+Base.hash(atom::Atom, h::UInt) =
+    hash(eltype(atom), hash(eltype(atom.mix_coeffs),
+                            hash(radial_basis(atom), hash(atom.orbitals, hash(atom.configurations, hash(atom.potential, h))))))
+
+
+function Base.write(io::IO, atom::Atom)
+    Φ = atom.radial_orbitals.args[2]
+    c = atom.mix_coeffs
+    write(io, length(Φ), length(c), Φ, c)
+end
+
+function Base.read!(io::IO, atom::Atom)
+    Φ = atom.radial_orbitals.args[2]
+    c = atom.mix_coeffs
+    nΦ,nc = length(Φ),length(c)
+    T = typeof(length(Φ))
+    fnΦ,fnc = read(io,T),read(io,T)
+    fnΦ == nΦ && fnc == nc ||
+        throw(DimensionMismatch("Require $(nΦ) radial coefficients and $(nc) mixing coefficients, file has $(fnΦ) + $(fnc)"))
+    read!(io, Φ)
+    read!(io, c)
+end
+
+atom_filename(atom::Atom, prefix, dir, args...) =
+    joinpath(dir, (isempty(prefix) ? "" : prefix*"-")*string(hash(atom, args...))*".wfn")
+
+function save(atom::Atom; prefix="", dir=".",
+              filename=atom_filename(prefix, dir),
+              verbose=false)
+    verbose && @info "Saving atom to $(filename)"
+    mkpath(dirname(filename))
+    open(file -> write(file, atom), filename, "w")
+end
+
+function load!(atom::Atom; prefix="", dir=".",
+               filename=atom_filename(prefix, dir),
+               verbose=false)
+    verbose && @info "Loading atom from $(filename)"
+    open(file -> read!(file, atom), filename)
 end
 
 get_config(config::Configuration) = config
@@ -36,7 +96,14 @@ function Base.copy(atom::A) where {A<:Atom}
     R,Φ = atom.radial_orbitals.args
     A(applied(*, R, copy(Φ)), copy(atom.orbitals),
       copy(atom.configurations), copy(atom.mix_coeffs),
-      atom.potential)
+      atom.potential, atom.S, atom.S̃)
+end
+
+function Base.complex(atom::Atom)
+    R,Φ = atom.radial_orbitals.args
+    Atom(applied(*, R, complex(Φ)), atom.orbitals,
+         atom.configurations, complex(atom.mix_coeffs),
+         atom.potential, atom.S, atom.S̃)
 end
 
 """
@@ -45,13 +112,28 @@ end
 Return the part of the electronic `configuration` that is not part of
 the the configuration modelled by the `potential`. For a point charge,
 this is the same as the `configuration` itself, but for
-pseudopotential, typically only the outer shells remain.
+pseudo-potentials, typically only the outer shells remain.
 """
-outsidecoremodel(configuration::Configuration, potential::P) where P =
+outsidecoremodel(configuration::Configuration, potential) =
     filter((orb,occ,state) -> nonrelorbital(getspatialorb(orb)) ∉ core(ground_state(potential)), configuration)
-outsidecoremodel(configuration::Configuration, ::PointCharge) where P =
+outsidecoremodel(configuration::Configuration, ::PointCharge) =
+    configuration
+outsidecoremodel(configuration::Configuration, ::Yukawa) =
     configuration
 outsidecoremodel(csf::CSF, potential) = outsidecoremodel(get_config(csf), potential)
+
+default_selector(atom::Atom) = Base.Fix2(outsidecoremodel, atom.potential)
+
+function Atom(P::RadialOrbitals, orbitals::Vector{<:AbstractOrbital},
+              configurations::Vector, mix_coeffs::AbstractVector,
+              potential::AbstractPotential)
+    R = first(P.args)
+
+    S = metric(R)
+    S̃ = matrix_element_metric(R)
+
+    Atom(P, orbitals, configurations, mix_coeffs, potential, S, S̃)
+end
 
 """
     Atom(undef, ::Type{T}, R::AbstractQuasiMatrix, configurations, potential, ::Type{C}[, mix_coeffs])
@@ -64,7 +146,9 @@ are initialized to `[1,0,0,...]`.
 """
 function Atom(::UndefInitializer, ::Type{T}, R::B, configurations::Vector{TC}, potential::P,
               ::Type{C},
-              mix_coeffs::CV=vcat(one(C), zeros(C, length(configurations)-1))) where {T<:Number,B<:BasisOrRestricted,TC,C,CV<:AbstractVector{<:C},P}
+              mix_coeffs::CV=vcat(one(C), zeros(C, length(configurations)-1)),
+              orbitals=unique_orbitals(outsidecoremodel.(get_config.(configurations), Ref(potential)))
+              ) where {T<:Number,B<:BasisOrRestricted,TC,C,CV<:AbstractVector{<:C},P}
     isempty(configurations) &&
         throw(ArgumentError("At least one configuration required to create an atom"))
     all(isequal(num_electrons(first(configurations))),
@@ -81,11 +165,10 @@ function Atom(::UndefInitializer, ::Type{T}, R::B, configurations::Vector{TC}, p
             throw(ArgumentError("Configuration modelled by nuclear potential ($(pot_cfg)) must belong to the closed set of all configurations"))
     end
 
-    orbs = unique_orbitals(outsidecoremodel.(get_config.(configurations), Ref(potential)))
-
-    Φ = Matrix{T}(undef, size(R,2), length(orbs))
+    Φ = Matrix{T}(undef, size(R,2), length(orbitals))
     RΦ = applied(*, R, Φ)
-    Atom(RΦ, orbs, configurations, mix_coeffs, potential)
+
+    Atom(RΦ, orbitals, configurations, mix_coeffs, potential)
 end
 
 """
@@ -150,7 +233,7 @@ Create a new atom using the same basis and nuclear potential as
 `other_atom`, but with a different set of `configurations`. The
 orbitals of `other_atom` are copied over as starting guess.
 """
-function Atom(other_atom::Atom{T,B,O,TC,CV,P},
+function Atom(other_atom::Atom{T,B,O,<:TC,CV,P},
               configurations::Vector{<:TC}; kwargs...) where {T,B,O,TC,CV,P}
     core(first(configurations)) == core(first(other_atom.configurations)) ||
         throw(ArgumentError("Core orbitals must be the same"))
@@ -218,7 +301,7 @@ radial_basis(atom::Atom) = first(atom.radial_orbitals.args)
 
 function orbital_index(atom::Atom{T,B,O}, orb::O) where {T,B,O}
     i = findfirst(isequal(orb),atom.orbitals)
-    i === nothing && throw(BoundsError("$(orb) not present among $(atom.orbitals)"))
+    i === nothing && throw(BoundsError(atom.orbitals, [orb]))
     i
 end
 
@@ -227,7 +310,7 @@ end
 
 Returns a copy of the `j`:th radial orbital.
 """
-Base.getindex(atom::Atom, j::I) where {I<:Integer} =
+Base.getindex(atom::Atom, j::Integer) =
     applied(*, radial_basis(atom), atom.radial_orbitals.args[2][:,j])
 
 """
@@ -235,15 +318,31 @@ Base.getindex(atom::Atom, j::I) where {I<:Integer} =
 
 Returns a copy of the radial orbital corresponding to `orb`.
 """
-Base.getindex(atom::Atom{T,B,O}, orb::O) where {T,B,O} =
+Base.getindex(atom::Atom{T,B,O}, orb::O) where {T,B,O<:AbstractOrbital} =
     atom[orbital_index(atom, orb)]
+
+"""
+    getindex(atom, js)
+
+Returns a copy of all radial orbitals with index `∈ js`.
+"""
+Base.getindex(atom::Atom, js::AbstractVector{<:Integer}) =
+    applied(*, radial_basis(atom), atom.radial_orbitals.args[2][:,js])
+
+"""
+    getindex(atom, orbs)
+
+Returns a copy of the radial orbitals corresponding to `orbs`.
+"""
+Base.getindex(atom::Atom{T,B,O}, orbs::AbstractVector{<:O}) where {T,B,O<:AbstractOrbital} =
+    atom[map(orb -> orbital_index(atom, orb), orbs)]
 
 """
     view(atom, j)
 
 Returns a `view` of the `j`:th radial orbital.
 """
-Base.view(atom::Atom, j::I) where {I<:Integer} =
+Base.view(atom::Atom, j::Integer) =
     applied(*, radial_basis(atom), view(atom.radial_orbitals.args[2], :, j))
 
 """
@@ -253,6 +352,14 @@ Returns a `view` of the radial orbital corresponding to `orb`.
 """
 Base.view(atom::Atom{T,B,O}, orb::O) where {T,B,O} =
     view(atom, orbital_index(atom, orb))
+
+"""
+    view(atom, j)
+
+Returns a `view` of all radial orbitals with index `∈ js`.
+"""
+Base.view(atom::Atom, js::AbstractVector{<:Integer}) =
+    applied(*, radial_basis(atom), view(atom.radial_orbitals.args[2], :, js))
 
 """
     SCF.coefficients(atom)
@@ -280,23 +387,27 @@ This calculates the _amplitude_ norm of the `atom`, i.e. ᵖ√N where N
 is the number electrons. By default, it uses the first `configuration`
 of the `atom` to weight the individual orbital norms.
 """
-function LinearAlgebra.norm(atom::Atom{T}, p::Real=2; configuration::Int=1) where T
+function LinearAlgebra.norm(atom::Atom{T}; configuration::Int=1) where T
     RT = real(T)
     n = zero(RT)
     for (orb,occ,state) in outsidecoremodel(get_config(atom.configurations[configuration]),
                                             atom.potential)
-        n += occ*norm(view(atom, orb), p)^p
+        j = orbital_index(atom, orb)
+        ϕ = view(atom.radial_orbitals.args[2], :, j)
+        n += occ*dot(ϕ, atom.S, ϕ)
     end
-    n^(one(RT)/p) # Unsure why you'd ever want anything but the 2-norm, but hey
+    Q = num_electrons(outsidecoremodel(first(atom.configurations),
+                                       atom.potential))
+    √(n/Q)
 end
 
 LinearAlgebra.normalize!(atom::A, v::V) where {A<:Atom,V<:AbstractVector} =
-    normalize!(applied(*, radial_basis(atom), v))
+    ldiv!(√(dot(v, atom.S, v)), v)
 
-function SCF.norm_rot!(ro::RO) where {RO<:RadialOrbital}
-    normalize!(ro)
-    SCF.rotate_first_lobe!(ro.args[2])
-    ro
+function SCF.norm_rot!(atom::A, v::V) where {A<:Atom,V<:AbstractVector}
+    normalize!(atom, v)
+    SCF.rotate_first_lobe!(v)
+    v
 end
 
 export Atom, DiracAtom, radial_basis

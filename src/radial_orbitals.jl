@@ -1,5 +1,11 @@
-const RadialOrbitalArray{T,N,B<:Basis} = Mul{<:Any,<:Tuple{<:BasisOrRestricted{B},<:AbstractArray{T,N}}}
-const AdjointRadialOrbitalArray{T,N,B<:Basis} = Mul{<:Any,<:Tuple{<:Adjoint{<:Any,<:AbstractArray{T,N}},<:AdjointBasisOrRestricted{B}}}
+# TODO: Replace by FuncArray et al.
+const RadialOrbitalArray{T,N,B<:Basis} = Applied{<:Any, typeof(*), <:Tuple{<:BasisOrRestricted{B},<:AbstractArray{T,N}}}
+const AdjointRadialOrbitalArray{T,N,B<:Basis} = Applied{<:Any, typeof(*), <:Tuple{<:Adjoint{<:Any,<:AbstractArray{T,N}},<:AdjointBasisOrRestricted{B}}}
+
+function Base.similar(A::RadialOrbitalArray)
+    R,v = A.args
+    applied(*, R, similar(v))
+end
 
 """
     RadialOrbital
@@ -24,7 +30,12 @@ const RadialOrbitals{T,B<:Basis} = RadialOrbitalArray{T,2,B}
 const AdjointRadialOrbitals{T,B<:Basis} = AdjointRadialOrbitalArray{T,2,B}
 
 const RadialOperator{T,B<:Basis,M<:AbstractMatrix{T}} =
-    Mul{<:Any,<:Tuple{<:BasisOrRestricted{B},M,<:AdjointBasisOrRestricted{B}}}
+    Applied{<:Any,typeof(*),<:Tuple{<:BasisOrRestricted{B},M,<:AdjointBasisOrRestricted{B}}}
+
+function LinearAlgebra.adjoint(op::RadialOperator)
+    Ac,M,B = op.args
+    applied(*, B', M', parent(Ac))
+end
 
 function Base.show(io::IO, ro::RadialOperator{T,B,M}) where {T,B,M}
     write(io, "RadialOperator(")

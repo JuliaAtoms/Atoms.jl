@@ -42,9 +42,9 @@ end
             nucleus = pc"H"
             rₘₐₓ = 50
 
-            @testset "$(grid_type)" for (grid_type,ρ,tol) ∈ [(:fd, 0.15, 2e-3),
-                                                             (:fedvr, 0.25, 1e-3)]
-                R = first(get_atom_grid(grid_type, rₘₐₓ, ρ, nucleus))
+            @testset "$(grid_type)" for (grid_type,grid_kwargs,tol) ∈ [(:fd_staggered, (ρ=0.15,),            2e-3),
+                                                                       (:fedvr,        (k=10,intervals=20,), 1e-3)]
+                R = get_atom_grid(grid_type, rₘₐₓ, nucleus; grid_kwargs...)
                 @testset "$(method)" for method in vcat([:arnoldi_shift_invert, :arnoldi],
                                                         grid_type == :fd ? :eigen : [])
                     atom = Atom(R, csfs([c"1s", c"2s", c"2p", c"3s", c"3p", c"3d"]),
@@ -57,7 +57,7 @@ end
             nucleus = pc"He"
             rₘₐₓ = 300
             ρ = 0.25
-            R = first(get_atom_grid(:fd, rₘₐₓ, ρ, nucleus))
+            R = get_atom_grid(:fd_staggered, rₘₐₓ, nucleus, ρ=ρ)
             @testset "CSFs" begin
                 atom = Atom(R, csfs([c"1s2", c"1s 2s", c"1s 2p", c"3s 3p", c"4s 3d", c"5s 5d"]),
                             nucleus, verbosity=4)
@@ -76,7 +76,7 @@ end
 
         @testset "Hydrogen" begin
             nucleus = pc"H"
-            R = RadialDifferences(N, ρ)
+            R = StaggeredFiniteDifferences(N, ρ)
             # atom = Atom(R, csfs(c"1s"), nucleus)
             atom = Atom(R, [spin_configurations(c"1s")[1]], nucleus)
 
@@ -96,7 +96,7 @@ end
 
         @testset "Helium" begin
             nucleus = pc"He"
-            R = RadialDifferences(N, ρ, charge(nucleus))
+            R = StaggeredFiniteDifferences(N, ρ)
             atom = Atom(R, spin_configurations(c"1s2"), nucleus, verbosity=Inf)
 
             @testset "Arnoldi" begin
@@ -130,10 +130,8 @@ end
         @testset "Beryllium" begin
             nucleus = pc"Be"
             Z = charge(nucleus)
-            rₘₐₓ = 50
-            ρ = 0.15
-            N = ceil(Int, rₘₐₓ/ρ + 1/2)
-            R = RadialDifferences(N, ρ, charge(nucleus))
+            rₘₐₓ = 15.0
+            R = StaggeredFiniteDifferences(0.05, 0.2, 0.01, rₘₐₓ)
             atom = Atom(R, spin_configurations(c"1s2 2s2"),
                         nucleus, verbosity=Inf)
 
@@ -155,12 +153,14 @@ end
                 end
             end
 
-            scf!(fock, ω=0.1, verbosity=2, num_printouts=typemax(Int))
+            optimize!(fock, ω=0.9, scf_method=:arnoldi, verbosity=2, num_printouts=typemax(Int))
             display(fock)
             println()
 
-            @test isapprox(27.211energy(fock.equations.equations[3]), -9.3227, rtol=0.04)
-            @test isapprox(27.211energy(fock.equations.equations[4]), -9.3227, rtol=0.04)
+            @test isapprox(energy(fock.equations.equations[1]), -4.7326698, rtol=1e-4)
+            @test isapprox(energy(fock.equations.equations[2]), -4.7326698, rtol=1e-4)
+            @test isapprox(energy(fock.equations.equations[3]), -0.3092695, rtol=1e-4)
+            @test isapprox(energy(fock.equations.equations[4]), -0.3092695, rtol=1e-4)
         end
     end
 end

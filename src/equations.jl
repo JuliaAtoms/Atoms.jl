@@ -20,6 +20,9 @@ end
 Base.length(hfeqs::AtomicEquations) = length(hfeqs.equations)
 Base.iterate(iter::AtomicEquations, args...) = iterate(iter.equations, args...)
 
+Base.show(io::IO, eqs::AtomicEquations{T}) where T =
+    write(io, "$(length(eqs)) AtomicEquations{$T}")
+
 """
     update!(equations::AtomicEquations[, atom::Atom])
 
@@ -74,9 +77,9 @@ SCF.symmetries(atom::Atom) =
 
 function get_operator(::FieldFreeOneBodyHamiltonian, atom::Atom,
                       orbital::aO, source_orbital::bO; kwargs...) where {aO,bO}
-    orbital == source_orbital ||
-        throw(ArgumentError("FieldFreeOneBodyHamiltonian not pertaining to $(orbital)"))
-    AtomicOneBodyHamiltonian(atom, orbital)
+    symmetry(orbital) == symmetry(source_orbital) ||
+        throw(ArgumentError("FieldFreeOneBodyHamiltonian between orbitals of different symmetries: ⟨$(orbital)|𝔥₀|$(source_orbital)⟩"))
+    AtomicOneBodyHamiltonian(atom, source_orbital)
 end
 
 for (i,HT) in enumerate([:KineticEnergyHamiltonian, :PotentialEnergyHamiltonian])
@@ -88,9 +91,13 @@ for (i,HT) in enumerate([:KineticEnergyHamiltonian, :PotentialEnergyHamiltonian]
 end
 
 function get_operator(op::CoulombPotentialMultipole, atom::Atom,
-                      orbital::aO, ::bO; kwargs...) where {aO,bO}
+                      orbital::aO, source_orbital::bO; kwargs...) where {aO,bO}
     a,b = op.a[1],op.b[1]
-    HFPotential(:exchange, op.o.k, a, a, atom, op.o.g; kwargs...)
+    if orbital == source_orbital
+        HFPotential(:direct, op.o.k, a, b, atom, op.o.g; kwargs...)
+    else
+        HFPotential(:exchange, op.o.k, a, source_orbital, atom, op.o.g; kwargs...)
+    end
 end
 
 get_operator(top::IdentityOperator, atom::Atom,
@@ -99,7 +106,8 @@ get_operator(top::IdentityOperator, atom::Atom,
 SCF.update!(::IdentityOperator; kwargs...) = nothing
 SCF.update!(::IdentityOperator, ::Atom; kwargs...) = nothing
 
-function get_operator(op::RadialOperator, atom::Atom, orbital::aO, source_orbital::bO; kwargs...) where {aO, bO}
+function get_operator(op::Op, atom::Atom, orbital::aO, source_orbital::bO;
+                      kwargs...) where {Op<:Union{<:RadialOperator,<:CoulombRepulsionPotential}, aO, bO}
     if orbital == source_orbital
         # In this case, the operator is diagonal in orbital space,
         # i.e. it maps an orbital onto itself.
@@ -113,7 +121,7 @@ end
 
 function get_operator(M::AbstractMatrix, atom::Atom, a::aO, b::bO; kwargs...) where {aO, bO}
     R = radial_basis(atom)
-    get_operator(R*M*R', atom, a, b; kwargs...)
+    get_operator(applied(*, R, M, R'), atom, a, b; kwargs...)
 end
 
 # RadialOperators (which are built from matrices), are independent of
@@ -121,14 +129,11 @@ end
 SCF.update!(::RadialOperator; kwargs...) = nothing
 SCF.update!(::RadialOperator, ::Atom; kwargs...) = nothing
 
-# function get_operator(top::Projector, ::Atom, orbital::aO, source_orbital::bO) where {aO,bO}
-#     orbital == source_orbital || return 0
-#     SourceTerm(IdentityOperator{1}(), source_orbital,
-#                top.ϕs[findfirst(isequal(source_orbital), top.orbitals)])
-# end
-
-get_operator(op::QO, atom::Atom, ::aO, ::bO; kwargs...) where {QO,aO,bO} =
-    throw(ArgumentError("Unsupported operator $op"))
+function get_operator(top::Projector, ::Atom, orbital::aO, source_orbital::bO) where {aO,bO}
+    orbital == source_orbital || return 0
+    SourceTerm(IdentityOperator{1}(), source_orbital,
+               top.ϕs[findfirst(isequal(source_orbital), top.orbitals)])
+end
 
 """
     generate_atomic_orbital_equations(atom::Atom, eqs::MCEquationSystem,
@@ -143,6 +148,10 @@ function generate_atomic_orbital_equations(atom::Atom{T,B,O}, eqs::MCEquationSys
                                            symmetries::Dict;
                                            verbosity=0,
                                            kwargs...) where {T,B,O}
+    p = if verbosity > 0
+        @info "Generating atomic orbital equations"
+        Progress(length(eqs.equations))
+    end
     map(eqs.equations) do equation
         orbital = equation.orbital
         terms = Vector{OrbitalHamiltonianTerm{O,O,T}}()
@@ -180,6 +189,8 @@ function generate_atomic_orbital_equations(atom::Atom{T,B,O}, eqs::MCEquationSys
         symmetry_orbitals = filter(!isequal(orbital), symmetries[symmetry(orbital)])
         verbosity > 1 && println("Symmetry: ", symmetry_orbitals)
 
+        !isnothing(p) && ProgressMeter.next!(p)
+
         AtomicOrbitalEquation(atom, equation, orbital, terms, symmetry_orbitals)
     end
 end
@@ -207,11 +218,11 @@ function Base.diff(atom::Atom,
                    energy_expression::EnergyExpression;
                    H::QuantumOperator=atomic_hamiltonian(atom),
                    overlaps::Vector{<:OrbitalOverlap}=OrbitalOverlap[],
-                   selector::Function=cfg -> outsidecoremodel(cfg, atom.potential),
+                   selector::Function=default_selector(atom),
                    configurations = selector.(atom.configurations),
                    orbitals = unique_orbitals(configurations),
                    symmetries = find_symmetries(orbitals),
-                   observables::Dict{Symbol,Tuple{<:QuantumOperator,Bool}} =
+                   observables::Union{Nothing,Dict{Symbol,Tuple{<:QuantumOperator,Bool}}} =
                    Dict{Symbol,Tuple{<:QuantumOperator,Bool}}(
                        :total_energy => (H,false),
                        :double_counted_energy => (H,true),
@@ -220,11 +231,11 @@ function Base.diff(atom::Atom,
                    modify_eoms!::Function = eqs -> nothing,
                    modify_integrals!::Function = (eqs,integrals,integral_map) -> nothing,
                    modify_equations!::Function = hfeqs -> nothing,
-                   verbosity=0)
-    eqs = diff(energy_expression, conj.(orbitals))
+                   verbosity=0, kwargs...)
+    eqs = diff(energy_expression, conj.(orbitals); verbosity=verbosity)
     modify_eoms!(eqs)
 
-    if verbosity > 0
+    if verbosity > 1
         println("Energy expression:")
         display(energy_expression)
         println()
@@ -237,19 +248,14 @@ function Base.diff(atom::Atom,
         display(symmetries)
         println()
 
-        if verbosity > 1
+        if verbosity > 2
             println("Common integrals:")
             display(eqs.integrals)
             println()
         end
     end
 
-    integrals = Vector{OrbitalIntegral}()
-    integral_map = Dict{Any,Int}()
-    poisson_cache = Dict{Int,CoulombIntegrals.PoissonCache}()
-    append_common_integrals!(integrals, integral_map,
-                             atom, eqs.integrals,
-                             poisson_cache=poisson_cache)
+    integrals, integral_map, poisson_cache = common_integrals(atom, eqs.integrals; verbosity=verbosity, kwargs...)
     modify_integrals!(eqs, integrals, integral_map)
 
     hfeqs = generate_atomic_orbital_equations(atom, eqs,
@@ -258,25 +264,29 @@ function Base.diff(atom::Atom,
                                               poisson_cache=poisson_cache)
     modify_equations!(hfeqs)
 
-    observables = map(collect(pairs(observables))) do (k,(operator,double_counted))
-        verbosity > 2 && println("Observable: $k ($operator)")
-        k => Observable(operator, atom, overlaps,
-                        integrals, integral_map,
-                        symmetries, selector;
-                        double_counted=double_counted,
-                        poisson_cache=poisson_cache,
-                        verbosity=verbosity)
-    end |> Dict{Symbol,Observable}
-
+    observables = if !isnothing(observables)
+        map(collect(pairs(observables))) do (k,(operator,double_counted))
+            verbosity > 3 && println("Observable: $k ($operator)")
+            k => Observable(operator, atom, overlaps,
+                            integrals, integral_map,
+                            symmetries;
+                            selector=selector,
+                            double_counted=double_counted,
+                            poisson_cache=poisson_cache,
+                            verbosity=verbosity, kwargs...)
+        end |> Dict{Symbol,Observable}
+    else
+        Dict{Symbol,Observable}()
+    end
     AtomicEquations(atom, hfeqs, integrals, observables)
 end
 
 Base.Matrix(H::QuantumOperator, atom::Atom;
             overlaps::Vector{<:OrbitalOverlap}=OrbitalOverlap[],
-            selector::Function=cfg -> outsidecoremodel(cfg, atom.potential),
+            selector::Function=default_selector(atom),
             configurations = selector.(atom.configurations),
             kwargs...) =
-    Matrix(H, configurations, overlaps)
+    Matrix(H, configurations, overlaps; kwargs...)
 
 function Base.diff(atom::Atom; H::QuantumOperator=atomic_hamiltonian(atom),
                    kwargs...)

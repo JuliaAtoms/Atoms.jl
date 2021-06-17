@@ -2,7 +2,7 @@
 
 function potential_matrix(V::Function, R)
     r = axes(R,1)
-    R'QuasiDiagonal(V.(r))*R
+    apply(*, R', QuasiDiagonal(V.(r)), R)
 end
 
 operator(M, R) = applied(*, R, M, R')
@@ -13,28 +13,38 @@ operator(M, R) = applied(*, R, M, R')
 Return the kinetic and one-body potential energy operators (as a
 tuple) for the orbital `orb` of `atom`.
 """
-function one_body_hamiltonian(::Type{Tuple}, atom::Atom, orb)
-    R = radial_basis(atom)
+function one_body_hamiltonian(::Type{Tuple}, R::AbstractQuasiMatrix,
+                              potential, orb)
+    ℓ = getℓ(orb)
+    Z = float(effective_charge(potential))
 
+    # This way we can apply the correct boundary condition at r = 0.
     D = Derivative(axes(R,1))
-    T = R'D'D*R
+    # CD = (potential isa PointCharge && R isa AbstractFiniteDifferences
+    #       ? CoulombDerivative(D, Z, ℓ) : D)
+    CD = (R isa AbstractFiniteDifferences ? CoulombDerivative(D, Z, ℓ) : D)
+
+    T = apply(*, R', CD', CD, R)
     T /= -2
 
     # Add in centrifugal part
-    ℓ = getℓ(orb)
     T += potential_matrix(r -> ℓ*(ℓ+1)/(2r^2), R)
 
-    V = potential_matrix(r -> atom.potential(orb, r), R)
+    V = potential_matrix(r -> potential(orb, r), R)
 
     operator(T, R), operator(V, R)
 end
+
+one_body_hamiltonian(::Type{Tuple}, atom::Atom, orb) =
+    one_body_hamiltonian(Tuple, radial_basis(atom),
+                         atom.potential, orb)
 
 """
     one_body_hamiltonian(::Type{Tuple}, atom, orb)
 
 Return the one-body energy operator for the orbital `orb` of `atom`.
 """
-one_body_hamiltonian(atom, orb) = +(one_body_hamiltonian(Tuple, atom, orb)...)
+one_body_hamiltonian(args...) = +(one_body_hamiltonian(Tuple, args...)...)
 
 # * One-body Hamiltonian operators
 
@@ -117,16 +127,6 @@ SCF.update!(::AtomicOneBodyHamiltonian, ::Atom) = nothing
 matrix(ĥ::AtomicOneBodyHamiltonian) = matrix(ĥ.op)
 
 """
-    ĥ ⋆ ϕ
-
-Return the lazy multiplicative action of the
-[`AtomicOneBodyHamiltonian`](@ref) `ĥ` on the radial orbital
-coefficient vector `ϕ`.
-"""
-LazyArrays.:(⋆)(ĥ::AtomicOneBodyHamiltonian, ϕ::AbstractVector) =
-    ĥ.op.args[2] ⋆ ϕ
-
-"""
     materialize!(::MulAdd{<:Any, <:Any, <:Any, T, <:AtomicOneBodyHamiltonian, Source, Dest})
 
 Materialize the lazy multiplication–addition of the type `y ← α*H*x +
@@ -134,13 +134,34 @@ Materialize the lazy multiplication–addition of the type `y ← α*H*x +
 are [`RadialOrbital`](@ref)s.
 """
 LazyArrays.materialize!(ma::MulAdd{<:Any, <:Any, <:Any, T, <:AtomicOneBodyHamiltonian, Source, Dest}) where {T,Source,Dest} =
-    materialize!(MulAdd(ma.α, ma.A.op.args[2], ma.B.args[2],
-                        ma.β, ma.C.args[2]))
+    mul!(ma.C.args[2], ma.A.op.args[2], ma.B.args[2], ma.α, ma.β)
+
+LinearAlgebra.mul!(y, h::AtomicOneBodyHamiltonian, x,
+                   α::Number=true, β::Number=false) =
+                       mul!(y, h.op.args[2], x, α, β)
 
 Base.show(io::IO, ĥ::AtomicOneBodyHamiltonian) =
     write(io, "ĥ($(ĥ.orbital))")
 
 # * Diagonalization of one-body Hamiltonian
+
+symmetric_transform(H::AbstractMatrix, U::AbstractMatrix) = U*H*U
+symmetric_transform(H::SymTridiagonal, U::Diagonal) = SymTridiagonal(U*H*U)
+
+function symmetric_orthogonalization(H, ::Type{<:Diagonal}, R)
+    S = Diagonal(metric(R))
+    S⁻¹ᐟ² = inv(√(S))
+    symmetric_transform(H, S⁻¹ᐟ²), S⁻¹ᐟ²
+end
+
+function symmetric_orthogonalization(H, ::Any, R)
+    S = metric(R)
+    S⁻¹ᐟ² = inv(√(Symmetric(S)))
+    symmetric_transform(H, S⁻¹ᐟ²), S⁻¹ᐟ²
+end
+
+symmetric_orthogonalization(H::AbstractMatrix, R::AbstractQuasiMatrix) =
+    symmetric_orthogonalization(H, metric_shape(R), R)
 
 """
     diagonalize_one_body(H, nev; method=:arnoldi_shift_invert, tol=1e-10, σ=-1)
@@ -160,13 +181,13 @@ choices are
 
 `tol` sets the Krylov tolerance.
 """
-function diagonalize_one_body(H::RadialOperator, nev::Int;
+function diagonalize_one_body(H::RadialOperator, R, nev::Int;
                               method::Symbol=:arnoldi_shift_invert, tol=1e-10, σ=-1,
                               verbosity=0, io=stdout)
     Hm = matrix(H)
     verbosity > 2 && println(io, "Diagonalizing via $(method)")
     if method == :arnoldi || method == :arnoldi_shift_invert
-        A,target = method == :arnoldi ? (Hm,SR()) : (ShiftInvert(Hm, σ),LR())
+        A,target = method == :arnoldi ? (LinearOperator(Hm, R),SR()) : (ShiftAndInvert(Hm, R, σ),LR())
 
         schur,history = partialschur(A, nev=nev, tol=tol, which=target)
         verbosity > 3 && println(io, history)
@@ -177,8 +198,13 @@ function diagonalize_one_body(H::RadialOperator, nev::Int;
             error("Could not converge the requested orbitals: $(history)")
         λ,schur.Q
     elseif method == :eigen
-        ee = eigen(Hm)
-        ee.values[1:nev],ee.vectors[:,1:nev]
+        H′, U = symmetric_orthogonalization(Hm, R)
+
+        !(metric_shape(R) <: Diagonal) && size(Hm,1) > 1000 &&
+            @warn "Attempting to diagonalize a matrix of size $(size(Hm)), prepare to wait"
+
+        ee = eigen(H′)
+        ee.values[1:nev], U*ee.vectors[:,1:nev]
     else
         throw(ArgumentError("Unknown diagonalization method $(method)"))
     end
